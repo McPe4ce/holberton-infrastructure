@@ -11,6 +11,7 @@ weak.
 | - | ----- | ------ | ---- | -------------- |
 | 1 | [Single server](#1--single-server) | [`single_server_stack.pdf`](single_server_stack.pdf) | The four basic services on one host | Everything |
 | 2 | [Redundant web tier](#2--redundant-web-tier) | [`redundant_web_tier.pdf`](redundant_web_tier.pdf) | Load balancer, second web/app node, DB replica | Load balancer, DB primary |
+| 3 | [Secured and monitored](#3--secured-and-monitored) | [`protected_monitored_stack.pdf`](protected_monitored_stack.pdf) | Three firewalls, HTTPS, monitoring system | Load balancer, DB primary |
 
 Each section follows the same shape: **Objective → Components → Key points →
 Limitations**.
@@ -162,3 +163,112 @@ maintain and test. Redundancy is a trade, not a free upgrade.
 - **No monitoring** — beyond HAProxy's own health checks there is no metric
   collection, log aggregation or alerting, so a failure, a saturating node or
   growing replication lag is noticed only when users complain.
+
+---
+
+## 3 · Secured and monitored
+
+**Objective:** explain the architectural purpose of encrypted transport, traffic
+filtering, and monitoring.
+**Schema:** [`protected_monitored_stack.pdf`](protected_monitored_stack.pdf)
+
+### Components added
+
+| Component | Role |
+| --------- | ---- |
+| **Firewall** (before the load balancer) | Screens everything arriving from the internet, so only the public web ports reach the entry point. |
+| **Firewall** ×2 (one before each web/app group) | Screens the internal hop, so each node accepts traffic from the load balancer rather than from anywhere. |
+| **Monitoring system** | Collects metrics pushed by agents on the load balancer, both web servers, both application servers, and the database primary. |
+| **HTTPS** | The user-facing transport, encrypted end to end up to the point where TLS is terminated. |
+
+The schema separates the two kinds of traffic: **solid arrows** carry user requests
+down through the firewalls into the nodes, while **dashed arrows** carry metrics
+one-way *out* of each service into the monitoring system (`LB Metrics`,
+`QPS Metrics`, `Metrics`). Nothing flows back down the dashed paths.
+
+### Key points
+
+**What a firewall does — and does not do.** A firewall filters traffic at the
+network boundary: it inspects packets against a policy of allowed ports, protocols
+and source/destination addresses, and drops everything not explicitly permitted.
+That shrinks the attack surface to the few ports that must be public and keeps
+internal services — the databases especially — off the open internet. What it does
+**not** do is inspect the meaning of traffic it has allowed: a request arriving on
+the permitted HTTPS port is passed through regardless of whether it carries an SQL
+injection, stolen credentials or an application exploit. A firewall controls *who
+can talk to what*, not *what they say*; application-level flaws, weak
+authentication and compromised hosts are all outside its reach.
+
+**Why HTTPS.** Plain HTTP travels in clear text, so anyone on the path — a shared
+Wi-Fi network, an ISP, a compromised router — can read or modify it. HTTPS wraps
+HTTP in TLS to give three things: **confidentiality** (credentials, session cookies
+and page content are encrypted), **integrity** (tampering in transit is detected),
+and **authenticity** (the certificate proves the client reached the real
+`www.foobar.com`, not an impostor). It is also a practical requirement: browsers
+mark plain HTTP as insecure and modern features refuse to run without it.
+
+**How monitoring collects data.** Each monitored service runs a small **agent** (or
+exposes an endpoint an agent reads) alongside it. The agent samples local
+signals — request counters and response codes from the web server, request duration
+and error rates from the application server, connections, query throughput and
+replication lag from the database, backend health and queue depth from HAProxy — and
+ships them at a fixed interval to the monitoring system, which stores them as time
+series and renders them as dashboards. The flow is **one-way**: services push
+metrics out, and the monitoring system sends nothing back into the request path,
+which is why it can be observed without becoming part of it. Collection is either
+**push** (the agent sends to the collector, as drawn here) or **pull** (the
+collector scrapes an endpoint the service exposes).
+
+**What QPS measures.** QPS — **queries per second** — is the rate of requests a
+service handles, counted per second over a sampling window. As a trend line it is
+the primary signal of *demand*: a steady climb shows organic growth and warns that
+capacity will need to grow with it; a sudden spike marks a traffic surge, a viral
+link or an attack; a sudden drop usually means something upstream is broken rather
+than that users left. Read next to latency and error rate it also exposes the
+**capacity limit** — the QPS at which response times start rising and errors appear
+is the point where the current node count stops being enough, and comparing per-node
+QPS shows whether the load balancer is spreading traffic evenly.
+
+**TLS termination leaves an internal hop.** The load balancer is where TLS is
+normally terminated: it decrypts the request once so it can inspect and route it,
+then forwards it to the chosen node. Past that point the traffic is **plaintext on
+the internal network** unless encryption is deliberately re-established on the
+second hop (a second TLS connection from the load balancer to Nginx, or an encrypted
+network between them). HTTPS at the edge therefore protects the user's leg of the
+journey, not automatically the whole path — anything able to observe traffic inside
+the infrastructure sees decrypted requests. The same applies to application-to-
+database traffic and to the replication stream, which are unencrypted here.
+
+**One writable primary is still a write-availability risk.** Firewalls and
+monitoring add protection and visibility but change nothing about the data tier:
+one database still accepts writes. If it fails, the replica keeps serving reads and
+the monitoring system will show the failure quickly, but the application cannot
+write until an operator promotes the replica and repoints the application — and
+promotion has to be deliberate, since a wrong call risks split-brain and divergent
+data. Monitoring shortens the *detection* time; it does not shorten the *recovery*,
+and it does not make the replica writable.
+
+**Collocation blocks independent scaling and maintenance.** Each node still bundles
+the web server, application server and database on one host, so the three cannot be
+sized or operated separately. They compete for the same CPU, RAM and disk I/O — a
+heavy query starves Nginx on the same box — and scaling the tier that is actually
+saturated means duplicating all three, paying for capacity in two tiers that did not
+need it. Maintenance is coupled the same way: restarting the host to patch the
+database also takes down that node's web and application services, and each service
+pulls the host configuration in a different direction (a database wants RAM and fast
+disk; a web tier wants CPU and network). Splitting these into separate tiers is the
+next stage of the design.
+
+### Limitations
+
+- **Load balancer is a SPOF** — still one HAProxy owning the public address, now
+  with one firewall in front of it that shares the same fate.
+- **Writable primary is a SPOF** — unchanged; recovery of writes is manual.
+- **Encryption stops at the edge** — the internal hop, the database connections and
+  the replication stream stay unencrypted unless TLS is continued past the load
+  balancer.
+- **Monitoring is observation only** — it records what happened and makes it
+  visible; it does not act, and no alerting is configured here, so someone still
+  has to be looking.
+- **Services remain collocated** — web, application and database share a host on
+  both nodes, which the next stage separates.
