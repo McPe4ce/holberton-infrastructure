@@ -12,6 +12,7 @@ weak.
 | 1 | [Single server](#1--single-server) | [`single_server_stack.pdf`](single_server_stack.pdf) | The four basic services on one host | Everything |
 | 2 | [Redundant web tier](#2--redundant-web-tier) | [`redundant_web_tier.pdf`](redundant_web_tier.pdf) | Load balancer, second web/app node, DB replica | Load balancer, DB primary |
 | 3 | [Secured and monitored](#3--secured-and-monitored) | [`protected_monitored_stack.pdf`](protected_monitored_stack.pdf) | Three firewalls, HTTPS, monitoring system | Load balancer, DB primary |
+| 4 | [Separated tiers](#4--separated-tiers) | [`separated_tiers.pdf`](separated_tiers.pdf) | Load balancer pair with failover, split web / app / database tiers | Database primary (writes) |
 
 Each section follows the same shape: **Objective → Components → Key points →
 Limitations**.
@@ -272,3 +273,98 @@ next stage of the design.
   has to be looking.
 - **Services remain collocated** — web, application and database share a host on
   both nodes, which the next stage separates.
+
+---
+
+## 4 · Separated tiers
+
+**Objective:** compare collocated and separated tiers, and remove the load balancer
+as a single point of failure at a conceptual level.
+**Schema:** [`separated_tiers.pdf`](separated_tiers.pdf)
+
+### Components
+
+| Tier | Contents | Role |
+| ---- | -------- | ---- |
+| **Entry** | **Load balancer (HAProxy)** ×2, joined by **failover** | Two entry points instead of one. One holds the public address and serves traffic; the other stands by to take that address over if the active one stops answering. |
+| **Web tier** | **Web server (Nginx)** ×2 | Terminates HTTP, serves static files, forwards dynamic requests to the application tier. |
+| **Application tier** | **Application server** ×2 (+ app files) | Executes the application code and generates responses. |
+| **Database tier** | **Database primary (MySQL)** + **Database replica (MySQL)** | The primary takes reads and writes; the replica takes reads and holds a current copy. |
+
+**Request path:** user → load balancer → web server → application server →
+database primary. **Replication** is a separate one-way flow, primary → replica,
+outside that path.
+
+### Key points
+
+**Compared with the single-server design.** Stage 1 put four services on one host,
+so every component was the same failure, the same maintenance window and the same
+capacity limit. Here each responsibility owns its own machines:
+
+| | Stage 1 — single server | Stage 4 — separated tiers |
+| - | ----------------------- | ------------------------- |
+| Hosts | One | Several, grouped by tier |
+| Entry point | The server itself | Two load balancers with failover |
+| Failure of one host | Whole site down | One tier loses one instance; the rest serve |
+| Scaling | Vertical only — a bigger box | Horizontal, per tier |
+| Maintenance | Restart takes down everything | Restart takes down one instance of one tier |
+| Tuning | One OS config for four services | Each host tuned for its own service |
+| Cost & complexity | Minimal | Higher on both counts |
+
+**Independent scaling.** Because the tiers no longer share a host, each can be sized
+for its own bottleneck. If dynamic requests are saturating CPU, application servers
+can be added without buying more web servers; if static traffic and TLS work
+dominate, the web tier grows on its own; if reads are the pressure, another replica
+is added without touching the front. Each host can also be *specified* differently —
+CPU and network for the web tier, memory and fast disk for the database — instead of
+one compromise machine serving all three. Collocated designs cannot do this: the
+only way to scale one service is to duplicate all of them, paying for capacity in
+tiers that did not need it.
+
+**Maintenance is contained.** Work on one tier no longer forces an outage on the
+others. Patching the database host does not stop the web servers; restarting Nginx
+does not interrupt in-flight database work; deploying application code touches only
+the application tier. And because every tier has more than one instance, instances
+can be taken out one at a time — drained from the load balancer, updated, returned —
+so unrelated components keep serving throughout, which is what makes rolling changes
+possible at all.
+
+**Sizing the tiers.** The diagram shows two of each because two is the smallest
+number that demonstrates redundancy — **it is not a recommendation**. Real instance
+counts come from evidence:
+
+- **Measured demand** — the QPS, latency and resource utilisation the monitoring
+  system from stage 3 is already collecting, not an estimate.
+- **Expected growth** — the trend over the planning horizon, so capacity is added
+  ahead of demand rather than after an outage.
+- **Failure tolerance** — decide how many instances may be down at once and still
+  serve peak load. Tolerating one failure in a two-node tier means each node must
+  carry 100% of peak alone; three nodes make that 50% each.
+- **A justified safety margin** — headroom for traffic spikes and for the slower
+  responses that come with load, chosen and written down with a reason.
+
+Maximising instance counts without that evidence just converts money into idle
+capacity while adding hosts to patch and monitor; copying a count from a diagram
+picks a number that was chosen to illustrate a concept, not to serve this workload.
+
+### Limitations
+
+- **The load-balancer pair is conceptual** — the schema shows two entry points and a
+  failover relationship, not a mechanism. What actually moves the public address
+  between them, how each detects that the other is gone, and how a split brain is
+  avoided are deliberately not designed here.
+- **Database failover is still manual** — one writable **primary** remains. The
+  replica serves reads and holds a current copy, but it does not accept writes, and
+  replication does not promote it. Losing the primary stops writes until an operator
+  promotes the replica and repoints the application tier; the site may stay readable
+  in the meantime.
+- **Cost** — several hosts per tier plus two load balancers is materially more
+  infrastructure than one server, and much of it is idle by design, since standby
+  capacity only earns its keep during a failure.
+- **Operational complexity** — more machines to provision, patch and keep
+  configured identically; a network between tiers that can itself fail or slow
+  down; replication lag to watch; and failure modes that are now partial and
+  therefore harder to diagnose than "the server is down".
+- **Internal traffic is still unencrypted** — as in stage 3, TLS terminates at the
+  entry point, so the hops between tiers and the replication stream are plaintext
+  unless encryption is continued.
